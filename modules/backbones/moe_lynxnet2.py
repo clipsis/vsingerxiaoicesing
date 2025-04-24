@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from modules.commons.common_layers import SinusoidalPosEmb, SwiGLU, Conv1d, Transpose
+from modules.commons.common_layers import SinusoidalPosEmb, SwiGLU, Transpose
 from utils.hparams import hparams
 
 class MoEContainer(nn.Module):
