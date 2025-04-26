@@ -138,7 +138,7 @@ class RevNetAutograd(torch.autograd.Function):
                 dx2 = layer(x1_4g)
             dx2.backward(grad_x2)
             x2 = x2 - dx2
-            grad_x1 = grad_x1 - x1_4g.grad
+            grad_x1 = grad_x1 + x1_4g.grad
         return torch.cat([grad_x1, grad_x2], dim=-1), None
 
 def RevNetInfer(x, layers):
