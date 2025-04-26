@@ -1,3 +1,7 @@
+# ReactNet: Diffusion MoE RevNet Singing Voice Synthesis
+# Copyright (C) 2025 Project Vsinger-Xiaoice Group of ICA Co.Ltd.
+# Released in WTFPL License.
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,13 +14,13 @@ class MoEContainer(nn.Module):
     def __init__(self, experts: list, dim: int, actives: int):
         super().__init__()
         self.dim_size = dim
-        self.experts = experts
+        self.experts = nn.ModuleList(experts)
         self.num_experts = len(experts)
         self.num_actives = actives
         self.router = nn.Sequential(
             nn.Linear(dim, dim),
             nn.SiLU(),
-            nn.Linear(dim, experts)
+            nn.Linear(dim, len(experts))
         )
     def forward(self, x):
         num_batchs = x.shape[0]
@@ -29,10 +33,21 @@ class MoEContainer(nn.Module):
         else:
             route_indice = torch.topk(route_value, k=self.num_actives, dim=1).indices
         route_mask = torch.scatter(
-            input=torch.full_like(route_value, False), dim=1,
+            input=torch.full_like(route_value, False, dtype=torch.bool), dim=1,
             index=route_indice,
-            src=torch.full_like(route_indice, True)
+            src=torch.full_like(route_indice, True, dtype=torch.bool)
         )
+        # Add Safety Token
+        x = torch.cat([
+            torch.zeros(1, self.dim_size, device=x.device), x
+        ], dim=0)
+        route_mask = torch.cat([
+            torch.ones(1, self.num_experts, dtype=torch.bool, device=x.device), route_mask
+        ], dim=0)
+        route_value = torch.cat([
+            torch.zeros(1, self.num_experts, device=x.device), route_value
+        ], dim=0)
+        # Softmax
         route_weight = F.softmax(torch.where(route_mask, route_value, float("-inf")), dim=1)
         # Experts compute
         y = x
@@ -45,12 +60,14 @@ class MoEContainer(nn.Module):
             e_weight = torch.gather(
                 input=route_weight[:, e_id], dim=0,
                 index=e_indice.squeeze(1)
-            )
+            )[:, None]
             y = torch.scatter_add(
                 input=y, dim=0,
                 index=e_indice.repeat(1, self.dim_size),
                 src=e_output * e_weight
             )
+        # Remove Safety Token
+        y = y[1:, :]
         return y.reshape(num_batchs, num_frames, self.dim_size)
 
 
@@ -87,11 +104,11 @@ class ReactNetBlock(nn.Module):
             nn.Linear(dim // senet_squeeze, dim),
             nn.Sigmoid()
         )
-        self.senet_res = nn.Parameter(torch.ones(dim))
+        self.senet_res = nn.Parameter(torch.ones(dim), requires_grad=True)
     def forward(self, res):
         x = self.norm(res)
         y = self.net(x)
-        gate = self.senet(torch.mean(x * self.senet_res[:, :, None] + y, dim=-2))
+        gate = self.senet(torch.mean(x * self.senet_res[None, None, :] + y, dim=-2))
         return res + y * gate
 
 class RevNetAutograd(torch.autograd.Function):
@@ -102,12 +119,12 @@ class RevNetAutograd(torch.autograd.Function):
         x1, x2 = torch.split(x, [x.size(-1) // 2, x.size(-1) // 2], dim=-1)
         for layer, seed in zip(layers, ctx.rng_seed):
             torch.cuda.manual_seed_all(seed)
-            x2 += layer(x1)
+            x2 = x2 + layer(x1)
             x1, x2 = x2, x1
         ctx.save_for_backward(x1, x2)
         return torch.cat([x1, x2], dim=-1)
     @staticmethod
-    def backward(ctx, grad_x, layer):
+    def backward(ctx, grad_x):
         x1, x2 = ctx.saved_tensors
         grad_x1, grad_x2 = torch.split(grad_x, [x1.size(-1), x2.size(-1)], dim=-1)
         for layer, seed in list(zip(ctx.layers, ctx.rng_seed))[::-1]:
@@ -120,8 +137,8 @@ class RevNetAutograd(torch.autograd.Function):
                 torch.cuda.manual_seed_all(seed)
                 dx2 = layer(x1_4g)
             dx2.backward(grad_x2)
-            x2 -= dx2
-            grad_x1 += x1_4g.grad
+            x2 = x2 - dx2
+            grad_x1 = grad_x1 - x1_4g.grad
         return torch.cat([grad_x1, grad_x2], dim=-1), None
 
 def RevNetInfer(x, layers):
